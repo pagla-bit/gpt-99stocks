@@ -8,7 +8,29 @@
 - Vectorized Monte Carlo (probabilistic), heuristic technical score, hybrid combination
 - Parallel fetching and caching. Expect long runtimes for full universe; adjust workers / sims.
 """
+############
+import pandas as pd
 
+def read_html_try_parsers(url):
+    # Try default (lxml) first, then bs4 if available — raise helpful error otherwise
+    last_err = None
+    try:
+        return pd.read_html(url)
+    except Exception as e_default:
+        last_err = e_default
+    try:
+        return pd.read_html(url, flavor='bs4')
+    except Exception as e_bs4:
+        last_err = e_bs4
+    # If we reach here neither parser worked — raise descriptive error
+    raise RuntimeError(
+        "Could not parse HTML tables from Wikipedia. Install one of the optional dependencies "
+        "required by pandas.read_html(): `lxml` or `beautifulsoup4` + `html5lib`.\n\n"
+        "Local install: pip install lxml\n"
+        "Or: pip install beautifulsoup4 html5lib\n\n"
+        f"Underlying error: {last_err}"
+    )
+############
 import streamlit as st
 import pandas as pd
 import numpy as np
