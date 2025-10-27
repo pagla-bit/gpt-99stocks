@@ -1,8 +1,8 @@
-# streamlit_99_stocks_dynamic_txt_load.py
+# streamlit_99_stocks_dynamic_manual_input.py
 """
-99 Stocks — Dynamic Indices (TXT Load + Full Dynamic Top-33 Selection)
-- Loads full Russell2000 (~2000), S&P400 (~400), S&P500 (~500) from stocks.txt
-- Evaluates ALL stocks per bucket using algo, selects top 33 by score
+99 Stocks — Dynamic Indices (Manual Ticker Input + Full Dynamic Top-33 Selection)
+- User inputs tickers manually for Russell2000 (small ~2000), S&P400 (mid ~400), S&P500 (large ~500)
+- Evaluates ALL input stocks per bucket using algo, selects top 33 by score
 - Three algorithm modes: probabilistic, technical, hybrid
 - Vectorized Monte Carlo, parallel evaluation, caching
 """
@@ -16,45 +16,7 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(layout="wide", page_title="99 Stocks — Dynamic Full Indices (TXT)")
-
-# -------------------- Load from TXT --------------------
-
-def load_stocks_from_txt(filename="stocks.txt"):
-    """
-    Load tickers from TXT file with sections for each index.
-    Returns (sp500_list, sp400_list, russell_list)
-    """
-    try:
-        with open(filename, 'r') as f:
-            lines = f.read().strip().split('\n')
-        universes = {}
-        current_key = None
-        current_list = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith('#') and ' - ' in line:
-                if current_key:
-                    universes[current_key] = sorted(set([t.strip() for t in current_list if t.strip()]))
-                current_key = line.split(' - ')[0].replace('# ', '').replace(' ', '').lower().replace('(', '').replace(')', '')
-                current_list = []
-            elif line and not line.startswith('#'):
-                current_list.extend([t.strip() for t in line.split(',') if t.strip()])
-        if current_list:
-            universes[current_key] = sorted(set([t.strip() for t in current_list if t.strip()]))
-        
-        sp500_list = universes.get('s&p500', [])  # Adjust key as per TXT format
-        sp400_list = universes.get('s&p400', [])
-        russell_list = universes.get('russell2000', [])
-        
-        if not all([sp500_list, sp400_list, russell_list]):
-            raise ValueError("Incomplete sections in TXT file. Ensure # S&P 500, # S&P 400, # Russell 2000 headers exist.")
-        
-        return sp500_list, sp400_list, russell_list
-    except FileNotFoundError:
-        raise FileNotFoundError(f"{filename} not found. Download/create it with index lists.")
-    except Exception as e:
-        raise RuntimeError(f"TXT parse error: {e}")
+st.set_page_config(layout="wide", page_title="99 Stocks — Dynamic Manual Input (Top 33 Selection)")
 
 # -------------------- Data fetcher (yfinance) --------------------
 
@@ -158,21 +120,21 @@ def evaluate_ticker(ticker, algo, target_return, sims, max_days, period="1y", in
 
 # -------------------- Streamlit UI --------------------
 
-st.title("99 Stocks — Dynamic Indices (Full ~2900 Stocks from TXT) — Top 33 Selection")
+st.title("99 Stocks — Dynamic Manual Ticker Input — Top 33 Selection")
 
 st.sidebar.header("Bucket Controls")
 
-st.sidebar.markdown("### Small Cap (Russell 2000 ~2000)")
+st.sidebar.markdown("### Small Cap (e.g., Russell 2000)")
 sc_algo = st.sidebar.selectbox("Algorithm", ['probabilistic', 'technical', 'hybrid'], index=0, key='sc_algo')
 sc_target = st.sidebar.number_input("Profit target %", min_value=1.0, max_value=100.0, value=5.0, step=0.5, key='sc_target')
 sc_days = st.sidebar.slider("Days horizon", min_value=1, max_value=30, value=3, step=1, key='sc_days')
 
-st.sidebar.markdown("### Mid Cap (S&P 400 ~400)")
+st.sidebar.markdown("### Mid Cap (e.g., S&P 400)")
 mc_algo = st.sidebar.selectbox("Algorithm", ['probabilistic', 'technical', 'hybrid'], index=0, key='mc_algo')
 mc_target = st.sidebar.number_input("Profit target %", min_value=1.0, max_value=200.0, value=10.0, step=0.5, key='mc_target')
 mc_days = st.sidebar.slider("Days horizon", min_value=3, max_value=90, value=14, step=1, key='mc_days')
 
-st.sidebar.markdown("### Large Cap (S&P 500 ~500)")
+st.sidebar.markdown("### Large Cap (e.g., S&P 500)")
 lc_algo = st.sidebar.selectbox("Algorithm", ['probabilistic', 'technical', 'hybrid'], index=0, key='lc_algo')
 lc_target = st.sidebar.number_input("Profit target %", min_value=1.0, max_value=500.0, value=30.0, step=1.0, key='lc_target')
 lc_days = st.sidebar.slider("Days horizon", min_value=14, max_value=365, value=90, step=1, key='lc_days')
@@ -181,32 +143,62 @@ st.sidebar.markdown("---")
 st.sidebar.header("Performance")
 sims = st.sidebar.selectbox("Monte Carlo sims", options=[500, 1000, 2500, 5000], index=2)
 workers = st.sidebar.slider("Parallel workers", 2, 24, 8)
-st.sidebar.markdown("**Warning:** Full eval (~2900 stocks) takes 5-15 min. Use fewer sims/workers for testing.")
+st.sidebar.markdown("**Warning:** Eval time depends on input sizes (up to ~2900 stocks: 5-15 min).")
 st.sidebar.markdown("---")
 run_request = st.sidebar.button("Run Full Evaluation")
 
-# -------------------- Load lists --------------------
+# -------------------- Manual Ticker Inputs --------------------
 
-status = st.empty()
-status.info("Loading stock lists from stocks.txt...")
+st.header("Enter Tickers Manually (Comma-Separated)")
 
-try:
-    sp500_list, sp400_list, russell_list = load_stocks_from_txt()
-except Exception as e:
-    status.error(f"Load failed: {e}")
-    st.stop()
+input_col1, input_col2, input_col3 = st.columns(3)
 
-status.success(f"Loaded: S&P500={len(sp500_list)} | S&P400={len(sp400_list)} | Russell2000={len(russell_list)}")
+with input_col1:
+    st.markdown("### Small Cap Tickers")
+    small_input = st.text_area(
+        "Paste tickers (e.g., ABR,ACAD,ACHC,...)", 
+        placeholder="ABR, ACAD, ACHC, ADMA, ... (up to ~2000)",
+        height=200,
+        key='small_input'
+    )
 
-small_universe = sorted(list(set(russell_list)))
-mid_universe = sorted(list(set(sp400_list)))
-large_universe = sorted(list(set(sp500_list)))
+with input_col2:
+    st.markdown("### Mid Cap Tickers")
+    mid_input = st.text_area(
+        "Paste tickers (e.g., A,ADM,ALB,...)", 
+        placeholder="A, ADM, ALB, ALLE, ... (up to ~400)",
+        height=200,
+        key='mid_input'
+    )
 
-st.markdown("### Universe Sizes")
+with input_col3:
+    st.markdown("### Large Cap Tickers")
+    large_input = st.text_area(
+        "Paste tickers (e.g., AAPL,MSFT,NVDA,...)", 
+        placeholder="AAPL, MSFT, NVDA, GOOGL, ... (up to ~500)",
+        height=200,
+        key='large_input'
+    )
+
+# Parse inputs
+def parse_tickers(input_text):
+    if not input_text:
+        return []
+    return sorted(set([t.strip().upper() for t in input_text.split(',') if t.strip()]))
+
+small_universe = parse_tickers(small_input)
+mid_universe = parse_tickers(mid_input)
+large_universe = parse_tickers(large_input)
+
+st.markdown("### Input Universe Sizes")
 col1, col2, col3 = st.columns(3)
-col1.metric("Small (Russell 2000)", len(small_universe))
-col2.metric("Mid (S&P 400)", len(mid_universe))
-col3.metric("Large (S&P 500)", len(large_universe))
+col1.metric("Small Cap", len(small_universe))
+col2.metric("Mid Cap", len(mid_universe))
+col3.metric("Large Cap", len(large_universe))
+
+if not all([small_universe, mid_universe, large_universe]):
+    st.warning("Enter tickers for all buckets to run evaluation.")
+    st.stop()
 
 # -------------------- Parallel evaluation --------------------
 
@@ -232,11 +224,11 @@ def evaluate_bucket_parallel(tickers, algo, target_pct, days, sims, workers, max
 
 if run_request:
     st.info("Running full dynamic evaluation... Progress by bucket.")
-    with st.spinner("Evaluating Small Cap (all ~2000)..."):
+    with st.spinner("Evaluating Small Cap..."):
         sc_df, sc_errs = evaluate_bucket_parallel(small_universe, sc_algo, sc_target, sc_days, sims, workers)
-    with st.spinner("Evaluating Mid Cap (all ~400)..."):
+    with st.spinner("Evaluating Mid Cap..."):
         mc_df, mc_errs = evaluate_bucket_parallel(mid_universe, mc_algo, mc_target, mc_days, sims, workers)
-    with st.spinner("Evaluating Large Cap (all ~500)..."):
+    with st.spinner("Evaluating Large Cap..."):
         lc_df, lc_errs = evaluate_bucket_parallel(large_universe, lc_algo, lc_target, lc_days, sims, workers)
 
     st.header("Top 33 Candidates (Dynamic Selection by Score)")
@@ -275,7 +267,7 @@ if run_request:
     st.markdown("---")
     st.write("**Notes:** Scores blend prob/tech (hybrid) or use single mode. Backtest results; not advice.")
 else:
-    st.info("Adjust controls & click 'Run Full Evaluation' to dynamically rank all stocks.")
+    st.info("Enter comma-separated tickers in the boxes above, adjust controls, & click 'Run Full Evaluation'.")
 
 st.markdown("---")
-st.write("Enhancements? CSV export, sector filters, or backtesting integration?")
+st.write("Enhancements? Auto-load from CSV, sector filters, or export results?")
