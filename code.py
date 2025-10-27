@@ -1,13 +1,12 @@
-# streamlit_99_stocks.py
+# streamlit_99_stocks_dynamic.py
 """
-99 Stocks Dashboard
-- Three market-cap buckets (<=1B, 1B-10B, >10B)
-- Pulls an initial universe from Wikipedia S&P500 (fallback list included)
-- Live market caps from yfinance for classification
-- For each bucket: choose algorithm (probabilistic, technical, hybrid),
-  set profit target and time window (days)
-- Up to 33 tickers per bucket (best-ranked by chosen algorithm)
-- Parallel fetching, caching, vectorized Monte Carlo
+99 Stocks — dynamic index-based universe
+- Russell 2000 (small), S&P 400 (mid), S&P 500 (large) — fetched from Wikipedia
+- Index boundaries are FIXED by source (Russell -> small, S&P400 -> mid, S&P500 -> large)
+- Three algorithm modes per bucket: probabilistic, technical, hybrid
+- Up to 33 top-ranked tickers shown per bucket
+- Vectorized Monte Carlo (probabilistic), heuristic technical score, hybrid combination
+- Parallel fetching and caching. Expect long runtimes for full universe; adjust workers / sims.
 """
 
 import streamlit as st
@@ -20,74 +19,122 @@ import requests
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(layout="wide", page_title="99 Stocks Dashboard")
+st.set_page_config(layout="wide", page_title="99 Stocks — Dynamic Indices")
 
-# -------------------- Utilities & Caching --------------------
+# ------------------------- Helper: Fetch index constituents -------------------------
+
+@st.cache_data(ttl=3600)
+def fetch_table_from_wiki(url, expected_symbol_cols=('Symbol','Ticker','Ticker symbol','Ticker Symbol'), verbose=False):
+    """
+    Use pandas.read_html to find a table containing a column for the ticker.
+    Returns list of tickers (strings) or raises ValueError if none found.
+    """
+    try:
+        tables = pd.read_html(url)
+    except Exception as e:
+        raise ValueError(f"Could not read tables from {url}: {e}")
+    for t in tables:
+        cols = [str(c).strip() for c in t.columns]
+        # check if any expected symbol column exists
+        for symcol in expected_symbol_cols:
+            if symcol in cols:
+                ticks = t[symcol].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
+                ticks = [x for x in ticks if x and x != 'nan']
+                if len(ticks) == 0:
+                    continue
+                return ticks
+    # sometimes the symbol column might be present but with different name; try heuristics
+    for t in tables:
+        # flatten all text and search for uppercase symbols-like strings in first column
+        first_col = t.iloc[:,0].astype(str).tolist()
+        candidates = []
+        for val in first_col:
+            if isinstance(val, str) and 1 < len(val) <= 10 and val.isupper() and not val.isdigit():
+                candidates.append(val.replace('.', '-'))
+        if len(candidates) > 10:
+            return candidates
+    raise ValueError(f"No ticker-like column found in tables from {url}")
 
 @st.cache_data(ttl=3600)
 def fetch_sp500_list():
-    """Try to fetch S&P500 tickers from Wikipedia. Return list of tickers."""
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = tables[0]
-        return [t.replace('.', '-') for t in df['Symbol'].astype(str).tolist()]
-    except Exception:
-        # Fallback conservative list (subset) if wiki fetch fails
-        return [
-            "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","V","JNJ","WMT","PG","DIS",
-            "MA","HD","BAC","XOM","CVX","PFE","KO","PEP","CSCO","ADBE","CMCSA","NFLX","INTC",
-            "T","VZ","CRM","ABBV","MRK","ABT","NKE","ORCL","TXN","QCOM","UNH","LIN","CVS","MCD",
-            "LOW","MDT","PM","SCHW","RTX","NEE","COST","AMGN","HON","UPS","BMY","SBUX","INTU"
-        ]
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    return fetch_table_from_wiki(url, expected_symbol_cols=('Symbol','Ticker'))
+
+@st.cache_data(ttl=3600)
+def fetch_sp400_list():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
+    return fetch_table_from_wiki(url, expected_symbol_cols=('Symbol','Ticker'))
+
+@st.cache_data(ttl=3600)
+def fetch_russell2000_list():
+    """
+    Try a few likely Wikipedia pages that might contain Russell 2000 constituents.
+    If none are present, raise a ValueError — user must ensure internet access / page layout.
+    """
+    # Try some plausible pages containing lists; these pages change often so we attempt a couple of URLs.
+    candidates = [
+        "https://en.wikipedia.org/wiki/Russell_2000_Index",
+        "https://en.wikipedia.org/wiki/List_of_companies_in_the_Russell_2000_Index",
+        "https://en.wikipedia.org/wiki/List_of_Russell_2000_companies"
+    ]
+    last_err = None
+    for url in candidates:
+        try:
+            ticks = fetch_table_from_wiki(url, expected_symbol_cols=('Ticker','Symbol','Ticker symbol'), verbose=True)
+            # sanity check that we got many tickers (Russell is ~2000)
+            if len(ticks) >= 100:
+                return ticks
+            # if we got a small list, still return it if >30
+            if len(ticks) >= 30:
+                return ticks
+            # else continue trying
+        except Exception as e:
+            last_err = e
+            continue
+    # As last attempt, try to read from other wikis that may have lists (community pages)
+    raise ValueError(f"Could not fetch Russell 2000 constituents from Wikipedia pages. Last error: {last_err}")
+
+# ------------------------- Data fetching & caching -------------------------
 
 @st.cache_data(ttl=1800)
 def get_data(ticker, period="1y", interval="1d"):
-    """Fetch OHLCV and info for a ticker via yfinance (cached)."""
+    """
+    Fetch OHLCV and info via yfinance. Returns (hist_df, info_dict) or (empty_df, {'_error':..}).
+    """
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period=period, interval=interval, actions=False, auto_adjust=True)
-        # Validate columns
         if hist.empty:
-            return pd.DataFrame(), {}
+            return pd.DataFrame(), {"_error": "empty history"}
         required_cols = ['Open','High','Low','Close','Volume']
         if not set(required_cols).issubset(set(hist.columns)):
-            return pd.DataFrame(), {"_error": "Incomplete OHLCV"}
+            return pd.DataFrame(), {"_error": "incomplete OHLCV"}
         info = tk.info if hasattr(tk, "info") else {}
         return hist, info
     except Exception as e:
         return pd.DataFrame(), {"_error": str(e)}
 
-# -------------------- Indicators & Signals --------------------
+# ------------------------- Indicators & scoring -------------------------
 
 def calc_indicators(df, rsi_period=14, macd_fast=12, macd_slow=26, macd_signal=9, sma_long=50, atr_period=14, adx_period=14):
-    """Add RSI, MACD, SMA_long, ATR, ADX to df."""
     df = df.copy()
-    # RSI
     delta = df['Close'].diff()
     up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
+    down = -delta.clip(upper=0)
     ma_up = up.ewm(com=rsi_period-1, adjust=False).mean()
     ma_down = down.ewm(com=rsi_period-1, adjust=False).mean()
     rs = ma_up / ma_down
     df['RSI'] = 100 - (100 / (1 + rs))
-
-    # MACD
     ema_fast = df['Close'].ewm(span=macd_fast, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=macd_slow, adjust=False).mean()
     df['MACD'] = ema_fast - ema_slow
     df['MACD_signal'] = df['MACD'].ewm(span=macd_signal, adjust=False).mean()
-
-    # SMA long
     df['SMA_long'] = df['Close'].rolling(sma_long).mean()
-
-    # ATR
     hl = df['High'] - df['Low']
     hc = (df['High'] - df['Close'].shift()).abs()
     lc = (df['Low'] - df['Close'].shift()).abs()
     tr = np.maximum(hl, np.maximum(hc, lc))
     df['ATR'] = tr.ewm(span=atr_period, adjust=False).mean()
-
-    # ADX-like
     plus_dm = df['High'].diff()
     minus_dm = -df['Low'].diff()
     plus_dm[plus_dm < 0] = 0
@@ -96,22 +143,15 @@ def calc_indicators(df, rsi_period=14, macd_fast=12, macd_slow=26, macd_signal=9
     minus_di = 100 * (minus_dm.ewm(span=adx_period).mean() / df['ATR'])
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
     df['ADX'] = dx.ewm(span=adx_period).mean()
-
     return df
 
-# -------------------- Probabilistic Monte Carlo (vectorized) --------------------
-
 def prob_reach_target(df, current_price, target_return, sims=2500, max_days=90):
-    """
-    Vectorized MC: simulate daily returns using historical mu/sigma (normal approx).
-    Returns probability to reach target within max_days.
-    """
     returns = df['Close'].pct_change().dropna().values
     if len(returns) < 30:
-        return 0.0  # insufficient history
+        return 0.0
     mu = returns.mean()
     sigma = returns.std()
-    if sigma == 0:
+    if sigma == 0 or np.isnan(sigma):
         return 0.0
     rand = np.random.normal(loc=mu, scale=sigma, size=(sims, max_days))
     price_paths = current_price * np.cumprod(1 + rand, axis=1)
@@ -119,68 +159,41 @@ def prob_reach_target(df, current_price, target_return, sims=2500, max_days=90):
     hits = (price_paths >= threshold).any(axis=1)
     return float(np.mean(hits))
 
-# -------------------- Technical scoring --------------------
-
 def technical_score(df):
-    """
-    Heuristic technical score 0..1
-    - RSI near oversold -> positive
-    - Recent MACD bullish crossover -> positive
-    - Price above SMA_long -> positive
-    - ADX > 25 increases score (trend)
-    - Momentum (last 5-day return) adds score
-    """
     if len(df) < 60:
         return 0.0
     latest = df.iloc[-1]
     prev = df.iloc[-2]
     score = 0.0
-    # RSI: lower RSI -> more likely bounce short-term
     if not np.isnan(latest['RSI']):
         if latest['RSI'] < 30:
             score += 0.35
         elif latest['RSI'] < 40:
             score += 0.15
-    # MACD crossover
     if not np.isnan(prev['MACD']) and not np.isnan(prev['MACD_signal']):
         if (prev['MACD'] < prev['MACD_signal']) and (latest['MACD'] > latest['MACD_signal']):
             score += 0.25
-    # Price vs SMA_long
     if not np.isnan(latest['SMA_long']):
         if latest['Close'] > latest['SMA_long']:
             score += 0.15
-    # ADX
     if not np.isnan(latest['ADX']) and latest['ADX'] > 25:
         score += 0.10
-    # Momentum: 5-day return
     if len(df) >= 6:
         mom = df['Close'].iloc[-1] / df['Close'].iloc[-6] - 1
-        # positive momentum increases likelihood for mid/long targets
         if mom > 0.03:
             score += 0.15
         elif mom > 0:
             score += 0.05
     return min(score, 1.0)
 
-# -------------------- Hybrid scoring --------------------
-
 def hybrid_score(df, current_price, target_return, sims, max_days, alpha_prob=0.6):
-    """
-    Combine probabilistic and technical scores.
-    alpha_prob: weight for probabilistic part (0..1); rest for technical.
-    Returns combined score 0..1
-    """
     p = prob_reach_target(df, current_price, target_return, sims=sims, max_days=max_days)
     t = technical_score(df)
     return alpha_prob * p + (1 - alpha_prob) * t
 
-# -------------------- Fetch & Evaluate single ticker --------------------
+# ------------------------- Ticker evaluation -------------------------
 
-def evaluate_ticker(ticker, period, interval, algo, target_return, max_days, sims):
-    """
-    Fetch data, compute indicators, then compute score based on algo.
-    Returns dict with ticker, marketCap, price, score, prob, techscore, note
-    """
+def evaluate_ticker(ticker, algo, target_return, sims, max_days, period="1y", interval="1d"):
     hist, info = get_data(ticker, period=period, interval=interval)
     if hist.empty:
         return {"ticker": ticker, "error": info.get("_error", "no data")}
@@ -188,195 +201,170 @@ def evaluate_ticker(ticker, period, interval, algo, target_return, max_days, sim
     latest = df.iloc[-1]
     current_price = float(latest['Close'])
     market_cap = info.get('marketCap', None)
-    prob = prob_reach_target(df, current_price, target_return, sims=sims, max_days=max_days) if algo in ('probabilistic','hybrid') else None
-    tech = technical_score(df) if algo in ('technical','hybrid') else None
+    prob = None
+    tech = None
+    score = 0.0
+    if algo in ('probabilistic', 'hybrid'):
+        prob = prob_reach_target(df, current_price, target_return, sims=sims, max_days=max_days)
+    if algo in ('technical', 'hybrid'):
+        tech = technical_score(df)
     if algo == 'probabilistic':
         score = prob
     elif algo == 'technical':
         score = tech
-    else:  # hybrid
-        # choose alpha based on horizon (longer -> give more weight to prob)
+    else:
         score = hybrid_score(df, current_price, target_return, sims=sims, max_days=max_days, alpha_prob=0.6)
-    return {
-        "ticker": ticker,
-        "marketCap": market_cap,
-        "price": current_price,
-        "prob": prob if prob is not None else np.nan,
-        "tech": tech if tech is not None else np.nan,
-        "score": score if score is not None else 0.0
-    }
+    return {"ticker": ticker, "marketCap": market_cap, "price": current_price, "prob": prob if prob is not None else np.nan, "tech": tech if tech is not None else np.nan, "score": score}
 
-# -------------------- UI Controls --------------------
+# ------------------------- Streamlit UI -------------------------
 
-st.title("99 Stocks — Algorithmic Selection by Market Cap & Target")
+st.title("99 Stocks — Dynamic Indices (Russell2000 / S&P400 / S&P500)")
 
-# Left control area — use sidebar with three expanders to represent each bucket's control panel
-st.sidebar.header("Bucket Controls")
+st.sidebar.header("Bucket Controls — Fixed by Index (Russell -> Small, S&P400 -> Mid, S&P500 -> Large)")
 
-st.sidebar.markdown("### Small Cap (<= $1B)")
-sc_algo = st.sidebar.selectbox("Algorithm (Small Cap)", options=['probabilistic','technical','hybrid'], index=0, key='sc_algo')
+st.sidebar.markdown("### Small Cap (Russell 2000)")
+sc_algo = st.sidebar.selectbox("Algorithm (Small Cap)", ['probabilistic','technical','hybrid'], index=0, key='sc_algo')
 sc_target = st.sidebar.number_input("Profit target % (Small Cap)", min_value=1.0, max_value=100.0, value=5.0, step=0.5, key='sc_target')
 sc_days = st.sidebar.slider("Days horizon (Small Cap)", min_value=1, max_value=21, value=3, step=1, key='sc_days')
 
-st.sidebar.markdown("### Mid Cap ($1B - $10B)")
-mc_algo = st.sidebar.selectbox("Algorithm (Mid Cap)", options=['probabilistic','technical','hybrid'], index=0, key='mc_algo')
+st.sidebar.markdown("### Mid Cap (S&P 400)")
+mc_algo = st.sidebar.selectbox("Algorithm (Mid Cap)", ['probabilistic','technical','hybrid'], index=0, key='mc_algo')
 mc_target = st.sidebar.number_input("Profit target % (Mid Cap)", min_value=1.0, max_value=200.0, value=10.0, step=0.5, key='mc_target')
 mc_days = st.sidebar.slider("Days horizon (Mid Cap)", min_value=3, max_value=60, value=14, step=1, key='mc_days')
 
-st.sidebar.markdown("### Large Cap (> $10B)")
-lc_algo = st.sidebar.selectbox("Algorithm (Large Cap)", options=['probabilistic','technical','hybrid'], index=0, key='lc_algo')
+st.sidebar.markdown("### Large Cap (S&P 500)")
+lc_algo = st.sidebar.selectbox("Algorithm (Large Cap)", ['probabilistic','technical','hybrid'], index=0, key='lc_algo')
 lc_target = st.sidebar.number_input("Profit target % (Large Cap)", min_value=1.0, max_value=500.0, value=30.0, step=1.0, key='lc_target')
 lc_days = st.sidebar.slider("Days horizon (Large Cap)", min_value=14, max_value=365, value=90, step=1, key='lc_days')
 
 st.sidebar.markdown("---")
-st.sidebar.header("Performance & Fetching")
+st.sidebar.header("Performance Controls")
 sims = st.sidebar.selectbox("Monte Carlo sims (vectorized)", options=[500,1000,2500,5000], index=2)
-batch_limit = st.sidebar.number_input("Max tickers to evaluate from universe", min_value=50, max_value=1000, value=500)
-workers = st.sidebar.slider("Parallel fetch workers", 1, 12, 6)
+workers = st.sidebar.slider("Parallel workers (fetch & eval)", 2, 24, 8)
+st.sidebar.markdown("**Important:** Fetching and evaluating ALL tickers (Russell2000 + S&P400 + S&P500) can take many minutes depending on workers/sims and API rate limits.")
 st.sidebar.markdown("---")
-if st.sidebar.button("Run selection / Refresh"):
-    run_flag = True
-else:
-    run_flag = False
+run_request = st.sidebar.button("Run evaluation for full indices")
 
-# Main: fetch universe
-with st.spinner("Preparing universe..."):
-    universe = fetch_sp500_list()
-    if len(universe) == 0:
-        st.error("Could not fetch a ticker universe. Update code or provide a CSV.")
-        st.stop()
-    # limit universe size for speed — up to batch_limit
-    universe = universe[:int(batch_limit)]
+# ------------------------- Fetch tickers for each index -------------------------
+status_placeholder = st.empty()
+status_placeholder.info("Fetching index constituent lists from Wikipedia... (this occurs once per hour cached)")
 
-# -------------------- Fetch market caps & classify --------------------
+try:
+    with st.spinner("Fetching S&P 500 tickers..."):
+        sp500_list = fetch_sp500_list()
+    with st.spinner("Fetching S&P 400 tickers..."):
+        sp400_list = fetch_sp400_list()
+    with st.spinner("Fetching Russell 2000 tickers..."):
+        russell_list = fetch_russell2000_list()
+except Exception as e:
+    st.error(f"Could not fetch index constituents: {e}")
+    st.stop()
 
-st.info("Fetching live market caps and classifying tickers (this can take a moment)...")
+status_placeholder.success(f"Fetched lists — S&P500: {len(sp500_list)} | S&P400: {len(sp400_list)} | Russell2000: {len(russell_list)}")
 
-def fetch_marketcap_to_list(tickers, period='6mo', interval='1d', workers=6):
-    results = {}
-    errors = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(get_data, t, period, interval): t for t in tickers}
-        for fut in as_completed(futures):
-            t = futures[fut]
-            hist, info = fut.result()
-            if hist.empty:
-                errors[t] = info.get("_error", "no data")
-                continue
-            mc = info.get('marketCap', None)
-            results[t] = mc
-    return results, errors
+# Keep index classification fixed as requested: Russell -> small, S&P400 -> mid, S&P500 -> large
+small_universe = sorted(list(set(russell_list)))
+mid_universe = sorted(list(set(sp400_list)))
+large_universe = sorted(list(set(sp500_list)))
 
-marketcaps, mc_errors = fetch_marketcap_to_list(universe, period="1y", interval="1d", workers=workers)
+st.markdown("### Universe sizes (pre-evaluation)")
+st.write(f"Small (Russell2000) tickers: {len(small_universe)}")
+st.write(f"Mid (S&P400) tickers: {len(mid_universe)}")
+st.write(f"Large (S&P500) tickers: {len(large_universe)}")
 
-# classify
-small_ticks = []
-mid_ticks = []
-large_ticks = []
-for t, mc in marketcaps.items():
-    if mc is None:
-        continue
-    # using USD marketCap
-    if mc < 1_000_000_000:
-        small_ticks.append(t)
-    elif mc < 10_000_000_000:
-        mid_ticks.append(t)
-    else:
-        large_ticks.append(t)
+# ------------------------- Run evaluation if requested -------------------------
 
-st.write(f"Universe evaluated: {len(universe)} tickers. Classified as Small: {len(small_ticks)}, Mid: {len(mid_ticks)}, Large: {len(large_ticks)}")
-
-# -------------------- Evaluate & rank tickers per bucket --------------------
-
-def evaluate_bucket(tickers, algo, target_percent, days, sims, workers, cap_name):
-    """
-    Evaluate tickers in parallel and return DataFrame of top results (score desc) up to 33.
-    """
-    target_return = target_percent / 100.0
+def evaluate_bucket_parallel(tickers, algo, target_pct, days, sims, workers, max_results=33):
+    target_return = float(target_pct) / 100.0
     results = []
     errors = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(evaluate_ticker, t, period="1y", interval="1d", algo=algo, target_return=target_return, max_days=days, sims=sims): t for t in tickers}
+    # evaluate in parallel
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(evaluate_ticker, t, algo, target_return, sims, days): t for t in tickers}
         for fut in as_completed(futures):
             t = futures[fut]
             try:
                 r = fut.result()
                 if r is None:
                     errors.append((t, "no result"))
-                elif 'error' in r:
+                    continue
+                if 'error' in r:
                     errors.append((t, r['error']))
-                else:
-                    results.append(r)
+                    continue
+                results.append(r)
             except Exception as e:
                 errors.append((t, str(e)))
     if not results:
         return pd.DataFrame(), errors
     df = pd.DataFrame(results)
-    # rank by score descending, show up to 33
-    df_sorted = df.sort_values(by='score', ascending=False).head(33).reset_index(drop=True)
+    df_sorted = df.sort_values(by='score', ascending=False).head(max_results).reset_index(drop=True)
     return df_sorted, errors
 
-# Only run evaluation if user clicked Run, otherwise show blank / instructions
-if run_flag:
-    with st.spinner("Evaluating Small Cap bucket..."):
-        sc_df, sc_errors = evaluate_bucket(small_ticks, sc_algo, sc_target, sc_days, sims, workers, "Small")
-    with st.spinner("Evaluating Mid Cap bucket..."):
-        mc_df, mc_errors = evaluate_bucket(mid_ticks, mc_algo, mc_target, mc_days, sims, workers, "Mid")
-    with st.spinner("Evaluating Large Cap bucket..."):
-        lc_df, lc_errors = evaluate_bucket(large_ticks, lc_algo, lc_target, lc_days, sims, workers, "Large")
+if run_request:
+    st.info("Running full evaluation. This may take several minutes — progress logs will appear below.")
+    # Evaluate each bucket — these may take time depending on universe sizes & workers
+    with st.spinner("Evaluating Small Cap (Russell2000) — this can be the longest..."):
+        sc_df, sc_errs = evaluate_bucket_parallel(small_universe, sc_algo, sc_target, sc_days, sims, workers, max_results=33)
+    with st.spinner("Evaluating Mid Cap (S&P400)..."):
+        mc_df, mc_errs = evaluate_bucket_parallel(mid_universe, mc_algo, mc_target, mc_days, sims, workers, max_results=33)
+    with st.spinner("Evaluating Large Cap (S&P500)..."):
+        lc_df, lc_errs = evaluate_bucket_parallel(large_universe, lc_algo, lc_target, lc_days, sims, workers, max_results=33)
 
-    # Display three tables side-by-side (or stacked if narrow)
-    st.header("Selected Stocks (up to 33 each)")
+    st.header("Top candidates (up to 33 per bucket)")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader(f"Small Cap (<= $1B) — target {sc_target}% in {sc_days}d — algo: {sc_algo}")
+        st.subheader(f"Small Cap (Russell2000) — target {sc_target}% in {sc_days}d — algo: {sc_algo}")
         if sc_df is not None and not sc_df.empty:
-            sc_df_display = sc_df.copy()
-            sc_df_display['prob'] = sc_df_display['prob'].round(3)
-            sc_df_display['tech'] = sc_df_display['tech'].round(3)
-            sc_df_display['score'] = sc_df_display['score'].round(3)
-            st.dataframe(sc_df_display[['ticker','price','marketCap','prob','tech','score']])
+            display = sc_df.copy()
+            display['prob'] = display['prob'].round(4)
+            display['tech'] = display['tech'].round(4)
+            display['score'] = display['score'].round(4)
+            st.dataframe(display[['ticker','price','marketCap','prob','tech','score']])
         else:
-            st.info("No candidates found or not enough data.")
-        if sc_errors:
-            st.write("Errors:", sc_errors[:5])
+            st.info("No results / insufficient data for Small Cap candidates.")
+        if sc_errs:
+            st.write("Sample errors (first 10):")
+            for e in sc_errs[:10]:
+                st.write(f"- {e[0]}: {e[1]}")
 
     with c2:
-        st.subheader(f"Mid Cap ($1B–$10B) — target {mc_target}% in {mc_days}d — algo: {mc_algo}")
+        st.subheader(f"Mid Cap (S&P400) — target {mc_target}% in {mc_days}d — algo: {mc_algo}")
         if mc_df is not None and not mc_df.empty:
-            mc_df_display = mc_df.copy()
-            mc_df_display['prob'] = mc_df_display['prob'].round(3)
-            mc_df_display['tech'] = mc_df_display['tech'].round(3)
-            mc_df_display['score'] = mc_df_display['score'].round(3)
-            st.dataframe(mc_df_display[['ticker','price','marketCap','prob','tech','score']])
+            display = mc_df.copy()
+            display['prob'] = display['prob'].round(4)
+            display['tech'] = display['tech'].round(4)
+            display['score'] = display['score'].round(4)
+            st.dataframe(display[['ticker','price','marketCap','prob','tech','score']])
         else:
-            st.info("No candidates found or not enough data.")
-        if mc_errors:
-            st.write("Errors:", mc_errors[:5])
+            st.info("No results / insufficient data for Mid Cap candidates.")
+        if mc_errs:
+            st.write("Sample errors (first 10):")
+            for e in mc_errs[:10]:
+                st.write(f"- {e[0]}: {e[1]}")
 
     with c3:
-        st.subheader(f"Large Cap (> $10B) — target {lc_target}% in {lc_days}d — algo: {lc_algo}")
+        st.subheader(f"Large Cap (S&P500) — target {lc_target}% in {lc_days}d — algo: {lc_algo}")
         if lc_df is not None and not lc_df.empty:
-            lc_df_display = lc_df.copy()
-            lc_df_display['prob'] = lc_df_display['prob'].round(3)
-            lc_df_display['tech'] = lc_df_display['tech'].round(3)
-            lc_df_display['score'] = lc_df_display['score'].round(3)
-            st.dataframe(lc_df_display[['ticker','price','marketCap','prob','tech','score']])
+            display = lc_df.copy()
+            display['prob'] = display['prob'].round(4)
+            display['tech'] = display['tech'].round(4)
+            display['score'] = display['score'].round(4)
+            st.dataframe(display[['ticker','price','marketCap','prob','tech','score']])
         else:
-            st.info("No candidates found or not enough data.")
-        if lc_errors:
-            st.write("Errors:", lc_errors[:5])
+            st.info("No results / insufficient data for Large Cap candidates.")
+        if lc_errs:
+            st.write("Sample errors (first 10):")
+            for e in lc_errs[:10]:
+                st.write(f"- {e[0]}: {e[1]}")
 
     st.markdown("---")
-    st.write("Notes:")
-    st.write("- Probabilities from MC are NOT guarantees. Backtest before trading.")
-    st.write("- Technical score is heuristic; adjust thresholds and logic if needed.")
-    st.write("- If many tickers lack marketCap in yfinance, consider expanding universe or using paid data.")
+    st.write("Notes & caveats:")
+    st.write("- Index constituent scraping depends on Wikipedia page structure. If the Russell2000 list page lacks a table, the fetch may fail; check internet access or Wikipedia layout.")
+    st.write("- Running the full universe is network- and CPU-heavy; consider limiting workers or using a subset for iterative development.")
+    st.write("- Probabilities are model outputs from historical-return Monte Carlo (normal approx). They are NOT guarantees.")
 else:
-    st.info("Configure your bucket controls on the left and click 'Run selection / Refresh' to evaluate up to 99 stocks.")
+    st.info("Configure the three buckets on the left. Click 'Run evaluation for full indices' to fetch & evaluate Russell2000, S&P400 and S&P500 tickers (this fetches ALL tickers from those indices).")
 
-# Footer: quick help
 st.markdown("---")
-st.write("Built with yfinance — fetches live marketCap to classify into buckets. Use smaller batch limits / fewer sims on limited hardware.")
-
+st.write("If you want: I can add CSV export buttons, incremental evaluation (evaluate top-N by market cap first), or persistent caching to avoid re-evaluating unchanged tickers. Tell me which next.")
