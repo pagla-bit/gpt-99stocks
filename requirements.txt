@@ -5,3 +5,7 @@ numpy
 plotly
 seaborn
 matplotlib
+beautifulsoup4
+html5lib
+lxml
+
