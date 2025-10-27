@@ -1,7 +1,7 @@
-# streamlit_99_stocks_dynamic_full.py
+# streamlit_99_stocks_dynamic_txt_load.py
 """
-99 Stocks — Dynamic Indices (Full Fetch + Dynamic Top-33 Selection)
-- Fetches full Russell2000 (~2000), S&P400 (~400), S&P500 (~500) from Wikipedia/MarketBeat
+99 Stocks — Dynamic Indices (TXT Load + Full Dynamic Top-33 Selection)
+- Loads full Russell2000 (~2000), S&P400 (~400), S&P500 (~500) from stocks.txt
 - Evaluates ALL stocks per bucket using algo, selects top 33 by score
 - Three algorithm modes: probabilistic, technical, hybrid
 - Vectorized Monte Carlo, parallel evaluation, caching
@@ -13,107 +13,48 @@ import numpy as np
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-import requests
-from io import StringIO
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(layout="wide", page_title="99 Stocks — Dynamic Full Indices")
+st.set_page_config(layout="wide", page_title="99 Stocks — Dynamic Full Indices (TXT)")
 
-# -------------------- Utility: robust read_html with headers --------------------
+# -------------------- Load from TXT --------------------
 
-def read_html_with_headers(url, timeout=15):
+def load_stocks_from_txt(filename="stocks.txt"):
     """
-    Read HTML from url using requests with a browser-like User-Agent, then parse via pandas.read_html.
-    Raises RuntimeError with helpful message on failure.
+    Load tickers from TXT file with sections for each index.
+    Returns (sp500_list, sp400_list, russell_list)
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
-    }
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        html = resp.text
-        tables = pd.read_html(StringIO(html))
-        if not tables:
-            raise RuntimeError("No HTML tables found on the page.")
-        return tables
+        with open(filename, 'r') as f:
+            lines = f.read().strip().split('\n')
+        universes = {}
+        current_key = None
+        current_list = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith('#') and ' - ' in line:
+                if current_key:
+                    universes[current_key] = sorted(set([t.strip() for t in current_list if t.strip()]))
+                current_key = line.split(' - ')[0].replace('# ', '').replace(' ', '').lower().replace('(', '').replace(')', '')
+                current_list = []
+            elif line and not line.startswith('#'):
+                current_list.extend([t.strip() for t in line.split(',') if t.strip()])
+        if current_list:
+            universes[current_key] = sorted(set([t.strip() for t in current_list if t.strip()]))
+        
+        sp500_list = universes.get('s&p500', [])  # Adjust key as per TXT format
+        sp400_list = universes.get('s&p400', [])
+        russell_list = universes.get('russell2000', [])
+        
+        if not all([sp500_list, sp400_list, russell_list]):
+            raise ValueError("Incomplete sections in TXT file. Ensure # S&P 500, # S&P 400, # Russell 2000 headers exist.")
+        
+        return sp500_list, sp400_list, russell_list
+    except FileNotFoundError:
+        raise FileNotFoundError(f"{filename} not found. Download/create it with index lists.")
     except Exception as e:
-        raise RuntimeError(
-            f"Could not fetch/parse tables from {url}. "
-            "Possible reasons: network issue or parser deps missing (lxml/bs4). "
-            "Fixes: pip install lxml beautifulsoup4 html5lib. "
-            f"Underlying error: {e}"
-        )
-
-# -------------------- Fetch index constituent lists (cached) --------------------
-
-@st.cache_data(ttl=86400)
-def fetch_sp500_list():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = read_html_with_headers(url)
-    df = tables[0]
-    col = next((c for c in df.columns if str(c).strip().lower() in ("symbol", "ticker")), df.columns[0])
-    tickers = df[col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
-    return [t for t in tickers if t and t != 'nan']
-
-@st.cache_data(ttl=86400)
-def fetch_sp400_list():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
-    tables = read_html_with_headers(url)
-    df = tables[0]
-    col = next((c for c in df.columns if str(c).strip().lower() in ("symbol", "ticker")), df.columns[0])
-    tickers = df[col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
-    return [t for t in tickers if t and t != 'nan']
-
-@st.cache_data(ttl=86400)
-def fetch_russell2000_list():
-    """
-    Fetch Russell 2000: Primary from MarketBeat (full table); fallback to Wikipedia candidates.
-    """
-    primary_url = "https://www.marketbeat.com/types-of-stock/russell-2000-stocks/"
-    try:
-        tables = read_html_with_headers(primary_url)
-        for df in tables:
-            # MarketBeat table has 'Symbol' column
-            if 'Symbol' in df.columns:
-                tickers = df['Symbol'].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
-                tickers = [t for t in tickers if t and t != 'nan' and len(t) <= 6]
-                if len(tickers) >= 1900:  # Close to 2000
-                    return sorted(set(tickers))
-    except Exception as e:
-        st.warning(f"MarketBeat fetch failed: {e}. Trying Wikipedia fallback...")
-    
-    # Fallback Wikipedia candidates (may not be full)
-    candidate_urls = [
-        "https://en.wikipedia.org/wiki/Russell_2000_Index",
-        "https://en.wikipedia.org/wiki/List_of_Russell_2000_companies"
-    ]
-    for url in candidate_urls:
-        try:
-            tables = read_html_with_headers(url)
-            for df in tables:
-                cols_lower = [str(c).strip().lower() for c in df.columns]
-                for target in ("symbol", "ticker"):
-                    if target in cols_lower:
-                        col_idx = cols_lower.index(target)
-                        col = df.columns[col_idx]
-                        ticks = df[col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
-                        ticks = [t for t in ticks if t and t != 'nan' and 1 < len(t) <= 6]
-                        if len(ticks) >= 100:  # Partial is better than none
-                            return sorted(set(ticks))
-                # Heuristic: first column uppercase short strings
-                first_col = df.iloc[:, 0].astype(str).str.strip().tolist()
-                cand = [v.replace('.', '-') for v in first_col if isinstance(v, str) and 1 < len(v) <= 6 and v.isupper() and not v[0].isdigit()]
-                if len(cand) >= 100:
-                    return sorted(set(cand))
-        except Exception:
-            continue
-    raise RuntimeError("Failed to fetch Russell 2000 list. Try manual CSV or check URLs.")
+        raise RuntimeError(f"TXT parse error: {e}")
 
 # -------------------- Data fetcher (yfinance) --------------------
 
@@ -217,7 +158,7 @@ def evaluate_ticker(ticker, algo, target_return, sims, max_days, period="1y", in
 
 # -------------------- Streamlit UI --------------------
 
-st.title("99 Stocks — Dynamic Indices (Full ~2900 Stocks) — Top 33 Selection")
+st.title("99 Stocks — Dynamic Indices (Full ~2900 Stocks from TXT) — Top 33 Selection")
 
 st.sidebar.header("Bucket Controls")
 
@@ -244,24 +185,22 @@ st.sidebar.markdown("**Warning:** Full eval (~2900 stocks) takes 5-15 min. Use f
 st.sidebar.markdown("---")
 run_request = st.sidebar.button("Run Full Evaluation")
 
-# -------------------- Fetch lists --------------------
+# -------------------- Load lists --------------------
 
 status = st.empty()
-status.info("Fetching full index lists (cached daily)...")
+status.info("Loading stock lists from stocks.txt...")
 
 try:
-    sp500_list = fetch_sp500_list()
-    sp400_list = fetch_sp400_list()
-    russell_list = fetch_russell2000_list()
+    sp500_list, sp400_list, russell_list = load_stocks_from_txt()
 except Exception as e:
-    status.error(f"Fetch failed: {e}")
+    status.error(f"Load failed: {e}")
     st.stop()
 
-status.success(f"Fetched: S&P500={len(sp500_list)} | S&P400={len(sp400_list)} | Russell2000={len(russell_list)}")
+status.success(f"Loaded: S&P500={len(sp500_list)} | S&P400={len(sp400_list)} | Russell2000={len(russell_list)}")
 
-small_universe = sorted(set(russell_list))
-mid_universe = sorted(set(sp400_list))
-large_universe = sorted(set(sp500_list))
+small_universe = sorted(list(set(russell_list)))
+mid_universe = sorted(list(set(sp400_list)))
+large_universe = sorted(list(set(sp500_list)))
 
 st.markdown("### Universe Sizes")
 col1, col2, col3 = st.columns(3)
